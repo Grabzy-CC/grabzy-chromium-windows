@@ -232,6 +232,8 @@ def main():
             source_tree,
             patch_bin_path=(source_tree / _PATCH_BIN_RELPATH)
         )
+        # Grabzy.CC: product name, translations and icons
+        subprocess.run([sys.executable, str(_ROOT_DIR / 'grabzy' / 'brand.py'), str(source_tree)], check=True)
 
         # Substitute domains
         domain_substitution_list = (_ROOT_DIR / 'ungoogled-chromium' / 'domain_substitution.list') if args.tarball else (_ROOT_DIR  / 'domain_substitution.list')
