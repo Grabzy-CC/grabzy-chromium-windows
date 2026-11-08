@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <g id="tile"><rect width="512" height="512" rx="112" fill="#12151e"/></g>
+  <g id="icon">
+    <path d="M355 157A140 140 0 1 0 396 256H322" fill="none" stroke="#eef0f5" stroke-width="64" stroke-linecap="round"/>
+    <circle id="live-dot" cx="236" cy="256" r="34" fill="#2ee87a"/>
+  </g>
+</svg>
