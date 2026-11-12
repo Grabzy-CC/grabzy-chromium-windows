@@ -1,0 +1,22 @@
+New profiles open dark, with the Grabzy.CC green as the colour seed, so the
+browser matches the website: near-black surfaces, green for what is active.
+Settings > Appearance can still change both; incognito stays grayscale.
+
+--- a/chrome/browser/themes/theme_service.cc
++++ b/chrome/browser/themes/theme_service.cc
+@@ -325,11 +325,13 @@
+       user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
+   registry->RegisterIntegerPref(
+       prefs::kBrowserColorScheme,
+-      std::to_underlying(ThemeService::BrowserColorScheme::kSystem));
++      std::to_underlying(ThemeService::BrowserColorScheme::kDark));
+   registry->RegisterIntegerPref(
+       prefs::kDeprecatedUserColorDoNotUse, SK_ColorTRANSPARENT,
+       user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
+-  registry->RegisterIntegerPref(prefs::kUserColor, SK_ColorTRANSPARENT);
++  // Grabzy.CC: the website's live green seeds the Material palette.
++  registry->RegisterIntegerPref(prefs::kUserColor,
++                                SkColorSetRGB(0x2E, 0xE8, 0x7A));
+   registry->RegisterIntegerPref(
+       prefs::kDeprecatedBrowserColorVariantDoNotUse,
+       static_cast<int>(ui::mojom::BrowserColorVariant::kSystem),

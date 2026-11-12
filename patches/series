@@ -24,3 +24,7 @@ ungoogled-chromium/windows/windows-fix-unsupported-llvm-flags.patch
 ungoogled-chromium/windows/windows-fix-building-without-crubit.patch
 ungoogled-chromium/windows/windows-fix-python.patch
 ungoogled-chromium/windows/windows-fix-typescript-lib-dom.patch
+grabzy/keep-websocket-pages-out-of-bfcache.patch
+grabzy/keep-background-timers-awake.patch
+grabzy/default-to-grabzy-theme.patch
+grabzy/grabzy-updater.patch
