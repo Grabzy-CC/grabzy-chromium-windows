@@ -1,0 +1,14 @@
+Chrome 156 lets a page with an open WebSocket into the back/forward cache and
+closes the socket there. Turn that off, so such a page is never cached and its
+relay connection is never cut behind the user's back.
+
+--- a/third_party/blink/renderer/platform/runtime_enabled_features.json5
++++ b/third_party/blink/renderer/platform/runtime_enabled_features.json5
+@@ -2442,7 +2442,6 @@
+     },
+     {
+       name: "DisconnectWebSocketOnBFCache",
+-      status: "stable",
+     },
+     {
+       // `kHidden` and `kHiddenButPainting` visibility states are treated as
