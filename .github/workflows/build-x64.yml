@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
   push:
     tags:
-      - '*'
+      - '*-grabzy.*'
 
 permissions:
   contents: read
@@ -15,3 +15,30 @@ concurrency:
 jobs:
   build:
     uses: ./.github/workflows/reusable-build.yml
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the installer and zip
+        uses: actions/download-artifact@v8
+        with:
+          name: chromium
+          path: artifacts
+      - name: Name them for Grabzy.CC
+        working-directory: artifacts
+        run: |
+          for f in ungoogled-chromium_*; do mv -v "$f" "grabzy-chromium_${f#ungoogled-chromium_}"; done
+          sha256sum grabzy-chromium_* | tee SHA256SUMS.txt
+      - name: Publish the release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Grabzy.CC ${{ github.ref_name }}
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/grabzy-chromium_*
+            artifacts/SHA256SUMS.txt
