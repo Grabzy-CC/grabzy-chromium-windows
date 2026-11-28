@@ -1,0 +1,505 @@
+Keep the browser up to date from Grabzy-CC's GitHub releases.
+
+Chromium builds the Google update UI out of non-Google builds, so this
+adds a small updater: see chrome/browser/grabzy/grabzy_updater.h.
+brand.py writes the release tag into release_tag.h.
+
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -841,6 +841,9 @@
+     "chrome_browser_interface_binders_webui.h",
+     "chrome_browser_interface_binders_webui_parts_features.cc",
+     "chrome_browser_main.cc",
++    "grabzy/grabzy_updater.cc",
++    "grabzy/grabzy_updater.h",
++    "grabzy/release_tag.h",
+     "chrome_content_browser_client.cc",
+     "chrome_content_browser_client_binder_policies.cc",
+     "chrome_content_browser_client_binder_policies.h",
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -167,6 +167,7 @@
+ #include "chrome/browser/ui/uma_browsing_activity_observer.h"
+ #include "chrome/browser/upgrade_detector/upgrade_detector.h"
+ #include "chrome/browser/usb/web_usb_detector.h"
++#include "chrome/browser/grabzy/grabzy_updater.h"
+ #include "components/soda/soda_installer.h"
+ #include "components/soda/soda_util.h"
+ #endif
+@@ -1754,6 +1755,8 @@
+                    base::BindOnce(&WebUsbDetector::Initialize,
+                                   base::Unretained(web_usb_detector_.get())));
+   }
++  grabzy_updater_ = std::make_unique<GrabzyUpdater>();
++  grabzy_updater_->Start();
+ #endif
+ 
+ #if BUILDFLAG(IS_WIN)
+@@ -2230,6 +2233,7 @@
+   }
+ 
+   web_usb_detector_.reset();
++  grabzy_updater_.reset();
+ 
+   for (auto& chrome_extra_part : chrome_extra_parts_) {
+     chrome_extra_part->PostMainMessageLoopRun();
+--- a/chrome/browser/chrome_browser_main.h
++++ b/chrome/browser/chrome_browser_main.h
+@@ -33,6 +33,7 @@
+ class StartupBrowserCreator;
+ class ShutdownWatcherHelper;
+ class WebUsbDetector;
++class GrabzyUpdater;
+ 
+ namespace apps {
+ class PublisherHostFactory;
+@@ -175,6 +176,7 @@
+   std::unique_ptr<ShutdownWatcherHelper> shutdown_watcher_;
+ 
+   std::unique_ptr<WebUsbDetector> web_usb_detector_;
++  std::unique_ptr<GrabzyUpdater> grabzy_updater_;
+ #endif  // !BUILDFLAG(IS_ANDROID)
+ 
+   // Vector of additional ChromeBrowserMainExtraParts.
+--- /dev/null
++++ b/chrome/browser/grabzy/grabzy_updater.cc
+@@ -0,0 +1,360 @@
++// Copyright 2026 Grabzy.CC
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/grabzy/grabzy_updater.h"
++
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/command_line.h"
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/json/json_reader.h"
++#include "base/logging.h"
++#include "base/path_service.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/task/thread_pool.h"
++#include "base/values.h"
++#include "build/build_config.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/grabzy/release_tag.h"
++#include "chrome/common/chrome_paths.h"
++#include "chrome/common/chrome_switches.h"
++#include "content/public/browser/browser_thread.h"
++#include "crypto/hash.h"
++#include "net/http/http_request_headers.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++
++#if BUILDFLAG(IS_WIN)
++#include "base/process/launch.h"
++#include "base/process/process.h"
++#include "chrome/installer/util/install_util.h"
++#elif BUILDFLAG(IS_MAC)
++#include "base/apple/bundle_locations.h"
++#include "base/process/launch.h"
++#include "base/process/process.h"
++#include "base/process/process_handle.h"
++#elif BUILDFLAG(IS_LINUX)
++#include "base/environment.h"
++#endif
++
++namespace {
++
++#if BUILDFLAG(IS_WIN)
++constexpr char kRepo[] = "grabzy-chromium-windows";
++constexpr char kAssetSuffix[] = "_installer_x64.exe";
++#elif BUILDFLAG(IS_MAC)
++constexpr char kRepo[] = "grabzy-chromium-macos";
++#if defined(ARCH_CPU_ARM64)
++constexpr char kAssetSuffix[] = "_arm64-macos.dmg";
++#else
++constexpr char kAssetSuffix[] = "_x86_64-macos.dmg";
++#endif
++#else
++constexpr char kRepo[] = "grabzy-chromium-linux";
++constexpr char kAssetSuffix[] = "-x86_64.AppImage";
++#endif
++constexpr char kAssetPrefix[] = "grabzy-chromium";
++constexpr char kDisableSwitch[] = "disable-grabzy-update";
++
++constexpr base::TimeDelta kFirstCheck = base::Minutes(3);
++constexpr base::TimeDelta kInterval = base::Hours(6);
++constexpr size_t kMaxReleaseJson = 1 << 20;
++constexpr int64_t kMaxDownload = int64_t{1} << 30;
++
++constexpr net::NetworkTrafficAnnotationTag kTrafficAnnotation =
++    net::DefineNetworkTrafficAnnotation("grabzy_updater", R"(
++      semantics {
++        sender: "Grabzy.CC updater"
++        description:
++          "Reads the latest Grabzy.CC release on GitHub and, when it is newer "
++          "than the running build, downloads it to install for the next "
++          "launch."
++        trigger: "A few minutes after startup, then every six hours."
++        data: "None."
++        destination: OTHER
++        destination_other: "api.github.com and GitHub release downloads."
++      }
++      policy {
++        cookies_allowed: NO
++        setting: "Start the browser with --disable-grabzy-update."
++        policy_exception_justification: "Not implemented."
++      })");
++
++std::unique_ptr<network::SimpleURLLoader> MakeLoader(const GURL& url,
++                                                     std::string_view accept) {
++  auto request = std::make_unique<network::ResourceRequest>();
++  request->url = url;
++  request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++  request->headers.SetHeader(net::HttpRequestHeaders::kUserAgent,
++                             "Grabzy.CC updater");
++  request->headers.SetHeader(net::HttpRequestHeaders::kAccept, accept);
++  auto loader = network::SimpleURLLoader::Create(std::move(request),
++                                                 kTrafficAnnotation);
++  loader->SetRetryOptions(
++      2, network::SimpleURLLoader::RETRY_ON_NETWORK_CHANGE |
++             network::SimpleURLLoader::RETRY_ON_5XX);
++  return loader;
++}
++
++// Whether this copy of the browser can replace itself. Runs where it may
++// block, before anything is downloaded.
++bool CanInstall() {
++#if BUILDFLAG(IS_WIN)
++  // A system-wide install needs an admin prompt, and a portable copy has
++  // nothing to update; only a per-user install updates itself.
++  return InstallUtil::IsPerUserInstall() &&
++         InstallUtil::GetChromeVersion(/*system_install=*/false).IsValid();
++#elif BUILDFLAG(IS_MAC)
++  return base::PathIsWritable(base::apple::OuterBundlePath().DirName());
++#elif BUILDFLAG(IS_LINUX)
++  std::optional<std::string> appimage =
++      base::Environment::Create()->GetVar("APPIMAGE");
++  return appimage && base::PathIsWritable(base::FilePath(*appimage).DirName());
++#else
++  return false;
++#endif
++}
++
++bool Verify(const base::FilePath& file, const std::string& digest) {
++  std::optional<std::vector<uint8_t>> bytes = base::ReadFileToBytes(file);
++  if (!bytes) {
++    return false;
++  }
++  const auto hash = crypto::hash::Sha256(*bytes);
++  if ("sha256:" + base::HexEncodeLower(hash) != digest) {
++    LOG(WARNING) << "Grabzy.CC update: checksum mismatch, not installing";
++    return false;
++  }
++  return true;
++}
++
++#if BUILDFLAG(IS_MAC)
++// Replacing the bundle while it runs breaks its helpers, so this waits for
++// the browser to quit, then swaps in the app from the disk image.
++constexpr char kSwapScript[] = R"(
++pid=$1 dmg=$2 app=$3
++while kill -0 "$pid" 2>/dev/null; do sleep 1; done
++mnt=$(mktemp -d) || exit 1
++if hdiutil attach -quiet -nobrowse -readonly -mountpoint "$mnt" "$dmg"; then
++  for src in "$mnt"/*.app; do break; done
++  rm -rf "$app.new"
++  if ditto "$src" "$app.new"; then
++    xattr -cr "$app.new"
++    rm -rf "$app" && mv "$app.new" "$app"
++  fi
++  hdiutil detach -quiet "$mnt"
++fi
++rmdir "$mnt"
++rm -f "$dmg"
++)";
++#endif
++
++// Puts the verified file in place for the next launch. Runs where it may
++// block; on Windows it waits for the installer.
++bool InstallFile(const base::FilePath& file) {
++#if BUILDFLAG(IS_WIN)
++  base::CommandLine command(file);
++  command.AppendSwitch("do-not-launch-chrome");
++  base::LaunchOptions options;
++  options.start_hidden = true;
++  base::Process process = base::LaunchProcess(command, options);
++  int exit_code = -1;
++  const bool exited = process.IsValid() &&
++                      process.WaitForExitWithTimeout(base::Minutes(15),
++                                                     &exit_code);
++  base::DeleteFile(file);
++  // FIRST_INSTALL_SUCCESS, INSTALL_REPAIRED, NEW_VERSION_UPDATED,
++  // EXISTING_VERSION_LAUNCHED and IN_USE_UPDATED from util_constants.h.
++  return exited && ((exit_code >= 0 && exit_code <= 3) || exit_code == 30);
++#elif BUILDFLAG(IS_MAC)
++  base::FilePath dir;
++  if (!base::PathService::Get(chrome::DIR_USER_DATA, &dir)) {
++    return false;
++  }
++  const base::FilePath dmg = dir.AppendASCII("Grabzy Update.dmg");
++  if (!base::Move(file, dmg)) {
++    return false;
++  }
++  const std::vector<std::string> argv = {
++      "/bin/sh",
++      "-c",
++      kSwapScript,
++      "grabzy-update",
++      base::NumberToString(base::GetCurrentProcId()),
++      dmg.value(),
++      base::apple::OuterBundlePath().value()};
++  base::LaunchOptions options;
++  options.new_process_group = true;
++  base::Process process = base::LaunchProcess(argv, options);
++  return process.IsValid();
++#elif BUILDFLAG(IS_LINUX)
++  // The running AppImage stays mounted from the old file, so it can be
++  // replaced now.
++  std::optional<std::string> appimage =
++      base::Environment::Create()->GetVar("APPIMAGE");
++  if (!appimage) {
++    return false;
++  }
++  const base::FilePath target(*appimage);
++  const base::FilePath next(*appimage + ".new");
++  const bool ok = base::Move(file, next) &&
++                  base::SetPosixFilePermissions(next, 0755) &&
++                  base::ReplaceFile(next, target, nullptr);
++  if (!ok) {
++    base::DeleteFile(file);
++    base::DeleteFile(next);
++  }
++  return ok;
++#else
++  return false;
++#endif
++}
++
++bool Install(base::FilePath file, std::string digest) {
++  if (!Verify(file, digest)) {
++    base::DeleteFile(file);
++    return false;
++  }
++  return InstallFile(file);
++}
++
++}  // namespace
++
++GrabzyUpdater::GrabzyUpdater() = default;
++
++GrabzyUpdater::~GrabzyUpdater() = default;
++
++void GrabzyUpdater::Start() {
++  const base::CommandLine& command_line =
++      *base::CommandLine::ForCurrentProcess();
++  if (std::string_view(grabzy::kReleaseTag) == "dev" ||
++      command_line.HasSwitch(kDisableSwitch) ||
++      command_line.HasSwitch(switches::kDisableBackgroundNetworking)) {
++    return;
++  }
++  content::GetUIThreadTaskRunner({base::TaskPriority::BEST_EFFORT})
++      ->PostDelayedTask(FROM_HERE,
++                        base::BindOnce(&GrabzyUpdater::Check,
++                                       weak_factory_.GetWeakPtr()),
++                        kFirstCheck);
++  timer_.Start(FROM_HERE, kInterval, this, &GrabzyUpdater::Check);
++}
++
++void GrabzyUpdater::Check() {
++  if (busy_) {
++    return;
++  }
++  busy_ = true;
++  loader_ = MakeLoader(GURL(std::string("https://api.github.com/repos/"
++                                        "Grabzy-CC/") +
++                            kRepo + "/releases/latest"),
++                       "application/vnd.github+json");
++  loader_->DownloadToString(
++      g_browser_process->shared_url_loader_factory().get(),
++      base::BindOnce(&GrabzyUpdater::OnRelease, weak_factory_.GetWeakPtr()),
++      kMaxReleaseJson);
++}
++
++void GrabzyUpdater::OnRelease(std::optional<std::string> body) {
++  loader_.reset();
++  if (!body) {
++    VLOG(1) << "Grabzy.CC update: could not read the latest release";
++    return Finish();
++  }
++  std::optional<base::DictValue> release =
++      base::JSONReader::ReadDict(*body, base::JSON_PARSE_RFC);
++  const std::string* tag = release ? release->FindString("tag_name") : nullptr;
++  if (!tag || *tag == grabzy::kReleaseTag || *tag == staged_tag_) {
++    return Finish();
++  }
++  const base::ListValue* assets = release->FindList("assets");
++  if (!assets) {
++    return Finish();
++  }
++  for (const base::Value& value : *assets) {
++    const base::DictValue* asset = value.GetIfDict();
++    if (!asset) {
++      continue;
++    }
++    const std::string* name = asset->FindString("name");
++    const std::string* url = asset->FindString("browser_download_url");
++    const std::string* digest = asset->FindString("digest");
++    if (!name || !url || !name->starts_with(kAssetPrefix) ||
++        !name->ends_with(kAssetSuffix)) {
++      continue;
++    }
++    const GURL download(*url);
++    // No checksum, no install: GitHub lists one for every uploaded file.
++    if (!digest || !digest->starts_with("sha256:") ||
++        !download.SchemeIs("https") || download.host() != "github.com") {
++      LOG(WARNING) << "Grabzy.CC update: " << *name
++                   << " has no usable checksum or URL";
++      return Finish();
++    }
++    base::ThreadPool::PostTaskAndReplyWithResult(
++        FROM_HERE,
++        {base::MayBlock(), base::TaskPriority::BEST_EFFORT,
++         base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
++        base::BindOnce(&CanInstall),
++        base::BindOnce(&GrabzyUpdater::OnCanInstall,
++                       weak_factory_.GetWeakPtr(), *tag, download, *digest));
++    return;
++  }
++  Finish();
++}
++
++void GrabzyUpdater::OnCanInstall(std::string tag,
++                                 GURL url,
++                                 std::string digest,
++                                 bool ok) {
++  if (!ok) {
++    VLOG(1) << "Grabzy.CC update: this copy cannot update itself";
++    return Finish();
++  }
++  VLOG(1) << "Grabzy.CC update: downloading " << tag;
++  loader_ = MakeLoader(url, "application/octet-stream");
++  loader_->DownloadToTempFile(
++      g_browser_process->shared_url_loader_factory().get(),
++      base::BindOnce(&GrabzyUpdater::OnDownloaded, weak_factory_.GetWeakPtr(),
++                     std::move(tag), std::move(digest)),
++      kMaxDownload);
++}
++
++void GrabzyUpdater::OnDownloaded(std::string tag,
++                                 std::string digest,
++                                 base::FilePath file) {
++  loader_.reset();
++  if (file.empty()) {
++    LOG(WARNING) << "Grabzy.CC update: download of " << tag << " failed";
++    return Finish();
++  }
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE,
++      {base::MayBlock(), base::WithBaseSyncPrimitives(),
++       base::TaskPriority::BEST_EFFORT,
++       base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
++      base::BindOnce(&Install, std::move(file), std::move(digest)),
++      base::BindOnce(&GrabzyUpdater::OnInstalled, weak_factory_.GetWeakPtr(),
++                     std::move(tag)));
++}
++
++void GrabzyUpdater::OnInstalled(std::string tag, bool ok) {
++  if (ok) {
++    VLOG(1) << "Grabzy.CC update: " << tag
++            << " is installed and starts with the next launch";
++    staged_tag_ = std::move(tag);
++  } else {
++    LOG(WARNING) << "Grabzy.CC update: installing " << tag << " failed";
++  }
++  Finish();
++}
++
++void GrabzyUpdater::Finish() {
++  busy_ = false;
++}
+--- /dev/null
++++ b/chrome/browser/grabzy/grabzy_updater.h
+@@ -0,0 +1,57 @@
++// Copyright 2026 Grabzy.CC
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_GRABZY_GRABZY_UPDATER_H_
++#define CHROME_BROWSER_GRABZY_GRABZY_UPDATER_H_
++
++#include <memory>
++#include <optional>
++#include <string>
++
++#include "base/files/file_path.h"
++#include "base/memory/weak_ptr.h"
++#include "base/timer/timer.h"
++#include "url/gurl.h"
++
++namespace network {
++class SimpleURLLoader;
++}  // namespace network
++
++// Keeps the browser on the newest Grabzy.CC release. A few minutes after
++// startup and then every six hours it reads the latest release of this
++// platform's repo on GitHub. When that is not the running build, it downloads
++// the platform's file, checks it against the SHA-256 GitHub lists for it, and
++// installs it so the next launch runs the new version:
++//   Windows  runs the installer silently; Chromium swaps in new_chrome.exe
++//            when the browser restarts.
++//   macOS    a small shell waits for the browser to quit, then replaces the
++//            app bundle with the one from the disk image.
++//   Linux    replaces the AppImage file in place.
++// Off with --disable-grabzy-update or --disable-background-networking.
++class GrabzyUpdater {
++ public:
++  GrabzyUpdater();
++  GrabzyUpdater(const GrabzyUpdater&) = delete;
++  GrabzyUpdater& operator=(const GrabzyUpdater&) = delete;
++  ~GrabzyUpdater();
++
++  void Start();
++
++ private:
++  void Check();
++  void OnRelease(std::optional<std::string> body);
++  void OnCanInstall(std::string tag, GURL url, std::string digest, bool ok);
++  void OnDownloaded(std::string tag, std::string digest, base::FilePath file);
++  void OnInstalled(std::string tag, bool ok);
++  void Finish();
++
++  std::unique_ptr<network::SimpleURLLoader> loader_;
++  base::RepeatingTimer timer_;
++  bool busy_ = false;
++  // A release installed in this session that takes over on the next launch.
++  std::string staged_tag_;
++  base::WeakPtrFactory<GrabzyUpdater> weak_factory_{this};
++};
++
++#endif  // CHROME_BROWSER_GRABZY_GRABZY_UPDATER_H_
+--- /dev/null
++++ b/chrome/browser/grabzy/release_tag.h
+@@ -0,0 +1,16 @@
++// Copyright 2026 Grabzy.CC
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_GRABZY_RELEASE_TAG_H_
++#define CHROME_BROWSER_GRABZY_RELEASE_TAG_H_
++
++namespace grabzy {
++
++// The release this build ships as, like "156.0.8078.79-1-grabzy.1". The build
++// pipeline writes it in; "dev" turns the updater off for local builds.
++inline constexpr char kReleaseTag[] = "dev";
++
++}  // namespace grabzy
++
++#endif  // CHROME_BROWSER_GRABZY_RELEASE_TAG_H_

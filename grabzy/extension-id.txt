@@ -1,0 +1,8 @@
+# The ID of the Grabzy.CC extension that the browser installs in every profile
+# and keeps updated from https://api.grabzy.cc/extension/update.xml.
+#
+# It is 32 letters a-p, derived from the key the backend signs the CRX with
+# (EXTENSION_CRX_KEY). Get it on the backend with `npm run extension:id`.
+# brand.py writes it into chrome/browser/extensions/external_provider_impl.cc.
+# While this says REPLACE-WITH-EXTENSION-ID, nothing is bundled.
+medbkhemijenjgmohlkbjmkbkdaccfmn

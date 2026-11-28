@@ -1,0 +1,109 @@
+Install the Grabzy.CC extension in every profile and keep it updated from
+api.grabzy.cc, the way Chrome installs and updates from its web store.
+
+- external_provider_impl.cc: a provider that offers the extension by update
+  URL (https://api.grabzy.cc/extension/update.xml), installed by default and
+  acknowledged, so there is no "new extension added" prompt. brand.py writes
+  the extension ID in from branding/extension-id.txt; while that holds no ID,
+  nothing is installed.
+- extension_downloader.cc: ungoogled-chromium starts no extension update
+  check at all. Start them again for https://api.grabzy.cc only; every other
+  check is still dropped.
+- safe_manifest_parser.cc: the update manifest's XML namespace contains
+  google.com, which domain substitution would rewrite after the patches, and
+  then no update manifest would parse. Split the literal so it stays as is.
+
+--- a/chrome/browser/extensions/external_provider_impl.cc
++++ b/chrome/browser/extensions/external_provider_impl.cc
+@@ -106,6 +106,36 @@
+ using ::base::i18n::LanguageTag;
+ using ::base::i18n::LanguageTagConverter;
+ 
++// Grabzy.CC: the extension this browser installs in every profile and keeps
++// updated from api.grabzy.cc. branding/brand.py writes the ID in at build time
++// from branding/extension-id.txt; while it is empty, nothing is installed.
++const char kGrabzyExtensionId[] = "";
++const char kGrabzyExtensionUpdateUrl[] =
++    "https://api.grabzy.cc/extension/update.xml";
++
++// Offers that one extension by update URL, as ExtensionMigrator offers Docs
++// Offline: the extension downloader then fetches its CRX from our server.
++class GrabzyExtensionLoader : public ExternalLoader {
++ public:
++  GrabzyExtensionLoader() = default;
++  GrabzyExtensionLoader(const GrabzyExtensionLoader&) = delete;
++  GrabzyExtensionLoader& operator=(const GrabzyExtensionLoader&) = delete;
++
++  void StartLoading() override {
++    base::DictValue prefs;
++    if (crx_file::id_util::IdIsValid(kGrabzyExtensionId)) {
++      base::DictValue entry;
++      entry.Set(ExternalProviderImpl::kExternalUpdateUrl,
++                kGrabzyExtensionUpdateUrl);
++      prefs.Set(kGrabzyExtensionId, std::move(entry));
++    }
++    LoadFinished(std::move(prefs));
++  }
++
++ private:
++  ~GrabzyExtensionLoader() override = default;
++};
++
+ #if BUILDFLAG(IS_CHROMEOS)
+ 
+ const char kCameraAppId[] = "hfhhnacclhffhdffklopdkcgdhifgngh";
+@@ -948,6 +978,17 @@
+   drive_migration_provider->set_auto_acknowledge(true);
+   provider_list->push_back(std::move(drive_migration_provider));
+ 
++  // Grabzy.CC: our extension (GrabzyExtensionLoader above). Installed by
++  // default and not from the store, so neither the store's install verifier
++  // nor the "new extension added" prompt applies; a user who removes it keeps
++  // it removed.
++  auto grabzy_extension_provider = std::make_unique<ExternalProviderImpl>(
++      service, base::MakeRefCounted<GrabzyExtensionLoader>(), profile,
++      ManifestLocation::kExternalPref, ManifestLocation::kExternalPrefDownload,
++      Extension::WAS_INSTALLED_BY_DEFAULT);
++  grabzy_extension_provider->set_auto_acknowledge(true);
++  provider_list->push_back(std::move(grabzy_extension_provider));
++
+   provider_list->push_back(std::make_unique<ExternalProviderImpl>(
+       service, base::MakeRefCounted<ExternalComponentLoader>(profile), profile,
+       ManifestLocation::kInvalidLocation, ManifestLocation::kExternalComponent,
+--- a/extensions/browser/updater/extension_downloader.cc
++++ b/extensions/browser/updater/extension_downloader.cc
+@@ -347,6 +347,18 @@
+     AddToFetches(fetches_preparing, std::move(task));
+   pending_tasks_.clear();
+ 
++  // Grabzy.CC: ungoogled-chromium starts no update check here, so no extension
++  // phones home. Start only checks against our server, for the extension this
++  // browser installs (chrome/browser/extensions/external_provider_impl.cc).
++  // Every other check is still dropped.
++  for (auto& fetch_list : fetches_preparing) {
++    for (auto& fetch : fetch_list.second) {
++      const GURL& url = fetch->base_url();
++      if (url.SchemeIs("https") && url.host() == "api.grabzy.cc") {
++        StartUpdateCheck(std::move(fetch));
++      }
++    }
++  }
+ }
+ 
+ void ExtensionDownloader::SetIdentityManager(
+--- a/extensions/browser/updater/safe_manifest_parser.cc
++++ b/extensions/browser/updater/safe_manifest_parser.cc
+@@ -28,8 +28,12 @@
+ namespace {
+ 
+ constexpr char kExpectedGupdateProtocol[] = "2.0";
++// Grabzy.CC: split so ungoogled-chromium's domain substitution, which runs
++// after the patches, leaves it as it is. It is a namespace name, not a host
++// anything is fetched from, and update servers (ours too) send it unchanged.
+ constexpr char kExpectedGupdateXmlns[] =
+-    "http://www.google.com/update2/response";
++    "http://www.goo"
++    "gle.com/update2/response";
+ 
+ // Helper function that reads in values for a single <app> tag. It returns a
+ // boolean indicating success or failure. On failure, it writes a error message

@@ -1,0 +1,16 @@
+Intensive wake-up throttling lets a hidden tab's timers fire once a minute after
+five minutes in the background. The relay heartbeat is 25 seconds and the server
+drops a socket after 62.5 quiet seconds, so a backgrounded tab would lose its
+connection. Ordinary background throttling (one wake-up per second) stays.
+
+--- a/third_party/blink/common/features.cc
++++ b/third_party/blink/common/features.cc
+@@ -878,7 +878,7 @@
+ // Android, it has no effect because page freezing kicks in at the same time. It
+ // would have an effect if the grace period ("grace_period_seconds" param) was
+ // reduced.
+-BASE_FEATURE(kIntensiveWakeUpThrottling, base::FEATURE_ENABLED_BY_DEFAULT);
++BASE_FEATURE(kIntensiveWakeUpThrottling, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+ // Name of the parameter that controls the grace period during which there is no
+ // intensive wake up throttling after a page is hidden. Defined here to allow
